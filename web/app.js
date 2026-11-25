@@ -87,12 +87,28 @@ if(SR){
   rec.onresult = (e) => { let t = ""; for(const r of e.results) t += r[0].transcript; $("#in").value = t;
     if(e.results[e.results.length-1].isFinal){ ask(t); $("#in").value = ""; } };
   rec.onend = () => { listening = false; $("#mic").classList.remove("on"); if(state.st==="listening") setState("idle"); };
-  rec.onerror = () => { listening = false; $("#mic").classList.remove("on"); };
+  rec.onerror = (e) => {
+    listening = false; $("#mic").classList.remove("on"); if(state.st==="listening") setState("idle");
+    const why = {
+      "not-allowed": "Microphone blocked. Click the lock icon in the address bar, allow Microphone, then reload the page.",
+      "service-not-allowed": "Microphone blocked by the browser. Allow it in site settings, then reload.",
+      "no-speech": "I didn't hear anything. Check your mic is the selected input device, and speak right after clicking MIC.",
+      "audio-capture": "No microphone found. Plug one in or pick the right input in your system sound settings.",
+      "network": "Speech recognition needs internet in this browser (Chrome/Edge send audio to their speech service). Check your connection, or just type.",
+      "aborted": ""
+    }[e.error];
+    if(why !== "") say("Mic error (" + e.error + "): " + (why || "unknown problem."), "e");
+  };
 }
-$("#mic").onclick = () => {
-  if(!rec){ say("Speech recognition isn't supported in this browser. Use Chrome or Edge.", "e"); return; }
+$("#mic").onclick = async () => {
+  if(!rec){ say("Speech recognition isn't supported in this browser. Use Chrome or Edge (not Firefox or Brave).", "e"); return; }
   if(listening){ rec.stop(); return; }
-  stopSpeaking(); listening = true; $("#mic").classList.add("on"); setState("listening"); rec.start();
+  stopSpeaking();
+  try{ // ask for mic permission explicitly so the browser shows its prompt
+    const s = await navigator.mediaDevices.getUserMedia({audio:true}); s.getTracks().forEach(t => t.stop());
+  }catch(err){ say("Microphone permission denied or no mic found (" + err.name + "). Allow it in the address bar lock icon, then reload.", "e"); return; }
+  listening = true; $("#mic").classList.add("on"); setState("listening");
+  try{ rec.start(); }catch(err){ listening = false; $("#mic").classList.remove("on"); }
 };
 
 /* ---------------------------------------------------------- toggles */

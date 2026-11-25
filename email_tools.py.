@@ -1,0 +1,134 @@
+"""Read-only email access for Jarvis (IMAP, standard library only).
+
+Safety by design:
+  * the mailbox is opened READ-ONLY, so nothing can be sent, deleted or moved
+  * messages are fetched with BODY.PEEK, so they are NOT marked as read
+  * it only runs when you ask about email, never in the background
+
+Credentials: copy email.json.example to email.json and fill it in, or set the
+environment variables JARVIS_EMAIL and JARVIS_EMAIL_PASSWORD.
+"""
+import email
+import imaplib
+import json
+import os
+import re
+from email.header import decode_header, make_header
+from pathlib import Path
+
+CFG_PATH = Path(__file__).resolve().parent / "email.json"
+WANTS = re.compile(r"\b(e-?mails?|inbox|gmail|mails?)\b", re.I)
+
+
+def wants_email(text):
+    return bool(WANTS.search(text))
+
+
+def _config():
+    cfg = {"imap_host": "imap.gmail.com", "address": "", "app_password": ""}
+    if CFG_PATH.exists():
+        try:
+            cfg.update(json.loads(CFG_PATH.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    cfg["address"] = os.environ.get("JARVIS_EMAIL", cfg["address"])
+    cfg["app_password"] = os.environ.get("JARVIS_EMAIL_PASSWORD", cfg["app_password"])
+    cfg["app_password"] = cfg["app_password"].replace(" ", "")  # Google shows it with spaces
+    return cfg
+
+
+def configured():
+    c = _config()
+    return bool(c["address"] and c["app_password"] and "@" in c["address"]
+                and "your" not in c["address"].lower())
+
+
+def _dec(value):
+    try:
+        return str(make_header(decode_header(value or ""))).strip()
+    except Exception:
+        return (value or "").strip()
+
+
+def _text_of(msg):
+    """Best-effort plain text of a message."""
+    html = None
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        ctype = part.get_content_type()
+        if "attachment" in str(part.get("Content-Disposition", "")).lower():
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        if ctype == "text/plain":
+            return text
+        if ctype == "text/html" and html is None:
+            html = text
+    if html:
+        html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
+        return re.sub(r"<[^>]+>", " ", html)
+    return ""
+
+
+def _clean(text, limit):
+    text = re.sub(r"https?://\S+", "[link]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _criteria(query):
+    """Turn a spoken request into IMAP search criteria."""
+    q = query.lower()
+    crit = []
+    if re.search(r"\b(unread|new|unseen)\b", q):
+        crit.append("UNSEEN")
+    m = re.search(r"\bfrom\s+(?:my\s+|the\s+)?([a-z0-9@._' -]{2,40}?)(?=\s+(?:about|in|on|since|today|yesterday|last|this)\b|[?.!,]|$)", q)
+    if m:
+        crit += ["FROM", '"%s"' % m.group(1).strip().replace('"', "")]
+    m = re.search(r"\babout\s+([a-z0-9@._' -]{2,40}?)(?=[?.!,]|$)", q)
+    if m:
+        crit += ["TEXT", '"%s"' % m.group(1).strip().replace('"', "")]
+    return crit or ["ALL"]
+
+
+def fetch_for(query, limit=6, body_chars=500):
+    """Return a text block of matching emails (newest first). Raises on failure."""
+    c = _config()
+    box = imaplib.IMAP4_SSL(c["imap_host"], timeout=25)
+    try:
+        box.login(c["address"], c["app_password"])
+        box.select("INBOX", readonly=True)  # read-only: cannot modify anything
+        typ, data = box.search(None, *_criteria(query))
+        ids = data[0].split()[-limit:][::-1] if typ == "OK" and data and data[0] else []
+        if not ids:
+            return "No matching emails found."
+        out = []
+        for i, mid in enumerate(ids, 1):
+            typ, parts = box.fetch(mid, "(BODY.PEEK[]<0.60000>)")
+            if typ != "OK" or not parts or not isinstance(parts[0], tuple):
+                continue
+            msg = email.message_from_bytes(parts[0][1])
+            out.append(
+                f"[{i}] From: {_clean(_dec(msg.get('From')), 80)}\n"
+                f"    Date: {_clean(msg.get('Date', ''), 40)}\n"
+                f"    Subject: {_clean(_dec(msg.get('Subject')), 120)}\n"
+                f"    Text: {_clean(_text_of(msg), body_chars)}"
+            )
+        return "\n".join(out) or "No matching emails found."
+    finally:
+        try:
+            box.logout()
+        except Exception:
+            pass
+
+
+def friendly_error(e):
+    s = str(e)
+    if "AUTHENTICATIONFAILED" in s or "Invalid credentials" in s or "LOGIN" in s.upper():
+        return ("Gmail refused the login. Use a Google APP PASSWORD (not your normal password), "
+                "with 2-step verification turned on, and check the address in email.json.")
+    if "timed out" in s or "getaddrinfo" in s or "Network" in s:
+        return "I couldn't reach the mail server. Check the internet connection."
+    return "Email error: " + s[:160]

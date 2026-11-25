@@ -36,7 +36,7 @@ function speak(text){
   const u = new SpeechSynthesisUtterance(text);
   if(voiceObj) u.voice = voiceObj; u.rate = 1.03; u.pitch = 0.92;
   u.onstart = () => { speakQ++; state.speaking = true; setState("speaking"); };
-  u.onend = u.onerror = () => { speakQ--; if(speakQ <= 0){ speakQ = 0; state.speaking = false; if(state.st==="speaking") setState("idle"); } };
+  u.onend = u.onerror = () => { speakQ--; if(speakQ <= 0){ speakQ = 0; state.speaking = false; if(state.st==="speaking") setState("idle"); resumeMic(); } };
   synth.speak(u);
 }
 function stopSpeaking(){ if(synth){ synth.cancel(); speakQ = 0; state.speaking = false; } }
@@ -45,7 +45,7 @@ function stopSpeaking(){ if(synth){ synth.cancel(); speakQ = 0; state.speaking =
 let busy = false;
 async function ask(text){
   text = text.trim(); if(!text || busy) return;
-  stopSpeaking(); busy = true; setState("thinking");
+  stopSpeaking(); if(listening){ try{ rec.abort(); }catch(e){} } busy = true; setState("thinking");
   say(text, "u"); state.history.push({role:"user", content:text});
   const bubble = say("…", "a"); let full = "", spoken = 0;
   try{
@@ -58,13 +58,16 @@ async function ask(text){
       let i; while((i = buf.indexOf("\n")) >= 0){
         const line = buf.slice(0, i).trim(); buf = buf.slice(i+1); if(!line) continue;
         const d = JSON.parse(line);
-        if(d.error){ bubble.className = "e"; bubble.textContent = d.error; setState("error"); busy = false; return; }
+        if(d.error){ bubble.className = "e"; bubble.textContent = d.error; setState("error"); busy = false; resumeMic(); return; }
+        if(d.open){ const p = say("", "a"), a = document.createElement("a"); a.href = d.open; a.target = "_blank"; a.rel = "noopener";
+          a.textContent = "↗ open " + d.label; a.style.color = "var(--cyan)"; p.appendChild(a); if(!d.noauto){ try{ window.open(d.open, "_blank", "noopener"); }catch(e){} } refreshGraph(); }
         if(d.t){ full += d.t;
           const clean = full.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").trimStart();
           bubble.textContent = clean;
           // speak sentence by sentence as they arrive
-          const m = clean.slice(spoken).match(/^[\s\S]*?[.!?](\s|$)/);
-          if(m){ speak(m[0]); spoken += m[0].length; }
+          if(d.quiet){ spoken = clean.length; }   // file text being written: show it, don't read it aloud
+          else { const m = clean.slice(spoken).match(/^[\s\S]*?[.!?](\s|$)/);
+            if(m){ speak(m[0]); spoken += m[0].length; } }
           $("#log").scrollTop = 1e9; }
       }
     }
@@ -74,7 +77,7 @@ async function ask(text){
     if(!state.speaking) setState("idle");
     if(/remember|note/i.test(text)) refreshGraph();
   }catch(e){ bubble.className = "e"; bubble.textContent = "Connection lost: " + e.message; setState("error"); }
-  busy = false;
+  busy = false; resumeMic();
 }
 $("#send").onclick = () => { ask($("#in").value); $("#in").value = ""; };
 $("#in").addEventListener("keydown", e => { if(e.key === "Enter"){ ask($("#in").value); $("#in").value = ""; } });
@@ -82,33 +85,45 @@ $("#in").addEventListener("keydown", e => { if(e.key === "Enter"){ ask($("#in").
 /* ---------------------------------------------------------- speech in */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, listening = false;
+state.hands = false;
+const FATAL = ["not-allowed","service-not-allowed","audio-capture","network"];
+const micBtn = $("#mic");
+function micUI(){ micBtn.classList.toggle("on", state.hands); micBtn.textContent = state.hands ? "LIVE" : "MIC"; }
+function startListening(){
+  if(!rec || !state.hands || listening || busy || state.speaking) return;
+  try{ rec.start(); listening = true; setState("listening"); }catch(e){}
+}
+// resume hands-free listening once Jarvis has finished thinking and speaking
+function resumeMic(){ if(state.hands) setTimeout(startListening, 350); }
 if(SR){
   rec = new SR(); rec.lang = "en-US"; rec.interimResults = true; rec.continuous = false;
   rec.onresult = (e) => { let t = ""; for(const r of e.results) t += r[0].transcript; $("#in").value = t;
-    if(e.results[e.results.length-1].isFinal){ ask(t); $("#in").value = ""; } };
-  rec.onend = () => { listening = false; $("#mic").classList.remove("on"); if(state.st==="listening") setState("idle"); };
+    if(e.results[e.results.length-1].isFinal){ $("#in").value = ""; ask(t); } };
+  rec.onend = () => {
+    listening = false; if(state.st==="listening") setState("idle");
+    resumeMic();   // no-op unless hands-free is on and Jarvis is idle
+  };
   rec.onerror = (e) => {
-    listening = false; $("#mic").classList.remove("on"); if(state.st==="listening") setState("idle");
+    listening = false; if(state.st==="listening") setState("idle");
+    if(e.error === "no-speech" || e.error === "aborted") return;   // normal in hands-free: just listen again
+    if(FATAL.includes(e.error)){ state.hands = false; micUI(); }
     const why = {
       "not-allowed": "Microphone blocked. Click the lock icon in the address bar, allow Microphone, then reload the page.",
       "service-not-allowed": "Microphone blocked by the browser. Allow it in site settings, then reload.",
-      "no-speech": "I didn't hear anything. Check your mic is the selected input device, and speak right after clicking MIC.",
       "audio-capture": "No microphone found. Plug one in or pick the right input in your system sound settings.",
-      "network": "Speech recognition needs internet in this browser (Chrome/Edge send audio to their speech service). Check your connection, or just type.",
-      "aborted": ""
+      "network": "Speech recognition needs internet in this browser (Chrome/Edge send audio to their speech service). Check your connection, or just type."
     }[e.error];
-    if(why !== "") say("Mic error (" + e.error + "): " + (why || "unknown problem."), "e");
+    say("Mic error (" + e.error + "): " + (why || "unknown problem."), "e");
   };
 }
-$("#mic").onclick = async () => {
+// click MIC once = hands-free on; click again = off
+micBtn.onclick = async () => {
   if(!rec){ say("Speech recognition isn't supported in this browser. Use Chrome or Edge (not Firefox or Brave).", "e"); return; }
-  if(listening){ rec.stop(); return; }
-  stopSpeaking();
+  if(state.hands){ state.hands = false; micUI(); if(listening){ try{ rec.abort(); }catch(e){} } return; }
   try{ // ask for mic permission explicitly so the browser shows its prompt
     const s = await navigator.mediaDevices.getUserMedia({audio:true}); s.getTracks().forEach(t => t.stop());
   }catch(err){ say("Microphone permission denied or no mic found (" + err.name + "). Allow it in the address bar lock icon, then reload.", "e"); return; }
-  listening = true; $("#mic").classList.add("on"); setState("listening");
-  try{ rec.start(); }catch(err){ listening = false; $("#mic").classList.remove("on"); }
+  state.hands = true; micUI(); stopSpeaking(); startListening();
 };
 
 /* ---------------------------------------------------------- toggles */
